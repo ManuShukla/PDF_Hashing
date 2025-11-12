@@ -7,6 +7,9 @@ import { createHash as createBlake2Hash } from 'blake2';
 import { performance } from 'perf_hooks';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import readline from 'readline';
 
 // Get the directory of this module
 const __filename = fileURLToPath(import.meta.url);
@@ -16,6 +19,28 @@ const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, '.env') });
 
 const { Pool } = pg;
+const execPromise = promisify(exec);
+
+/**
+ * Create readline interface for user input
+ */
+function createReadlineInterface() {
+    return readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+}
+
+/**
+ * Ask user a question and return their answer
+ */
+function askQuestion(rl, question) {
+    return new Promise((resolve) => {
+        rl.question(question, (answer) => {
+            resolve(answer.trim());
+        });
+    });
+}
 
 class PDFHasher {
     /**
@@ -24,23 +49,31 @@ class PDFHasher {
      * Hashes only PDF content, excluding metadata for true content-based deduplication.
      */
     
-    constructor(dbConfig, includeMetadata = false, algorithm = 'blake2b') {
+    constructor(dbConfig, includeMetadata = false, algorithm = 'blake2b', parser = 'pdf-parse') {
         /**
          * Initialize the PDFHasher with database connection.
          * 
          * @param {object} dbConfig - Database configuration object
          * @param {boolean} includeMetadata - If true, hash entire file (old behavior)
          * @param {string} algorithm - Hash algorithm to use
+         * @param {string} parser - PDF parser to use ('pdf-parse' or 'pdftotext')
          */
         this.dbConfig = dbConfig;
         this.pool = null;
         this.includeMetadata = includeMetadata;
         this.algorithm = algorithm.toLowerCase();
+        this.parser = parser.toLowerCase();
         
         // Validate algorithm
         const validAlgorithms = ['blake2b', 'sha256', 'sha512', 'sha3-256', 'sha3-512'];
         if (!validAlgorithms.includes(this.algorithm)) {
             throw new Error(`Algorithm must be one of: ${validAlgorithms.join(', ')}`);
+        }
+        
+        // Validate parser
+        const validParsers = ['pdf-parse', 'pdftotext'];
+        if (!validParsers.includes(this.parser)) {
+            throw new Error(`Parser must be one of: ${validParsers.join(', ')}`);
         }
     }
     
@@ -151,13 +184,21 @@ class PDFHasher {
         const hasher = this._getHasher();
         
         try {
-            const dataBuffer = await fs.readFile(filePath);
-            const pdfData = await pdfParse(dataBuffer);
+            let text;
             
-            console.log(`  Pages: ${pdfData.numpages}`);
-            
-            // Extract and hash text content
-            const text = pdfData.text;
+            if (this.parser === 'pdftotext') {
+                // Use pdftotext command (faster)
+                const { stdout } = await execPromise(`pdftotext "${filePath}" -`);
+                text = stdout;
+                console.log(`  Parser: pdftotext (poppler-utils)`);
+            } else {
+                // Use pdf-parse library (default)
+                const dataBuffer = await fs.readFile(filePath);
+                const pdfData = await pdfParse(dataBuffer);
+                text = pdfData.text;
+                console.log(`  Pages: ${pdfData.numpages}`);
+                console.log(`  Parser: pdf-parse`);
+            }
             
             if (text) {
                 // Normalize whitespace for consistency
@@ -341,9 +382,10 @@ class PDFHasher {
     }
 }
 
-async function compareAlgorithms(dbConfig, pdfFilePath) {
+async function compareAlgorithms(dbConfig, pdfFilePath, parser = 'pdf-parse') {
     /**
      * Compare all hash algorithms on the same PDF file.
+     * @param {string} parser - PDF parser to use ('pdf-parse' or 'pdftotext')
      */
     const algorithms = ['blake2b', 'sha256', 'sha512', 'sha3-256', 'sha3-512'];
     const results = [];
@@ -356,13 +398,14 @@ async function compareAlgorithms(dbConfig, pdfFilePath) {
     console.log('='.repeat(80));
     console.log(`File: ${pdfFilePath.split('/').pop()}`);
     console.log(`Size: ${fileSize.toLocaleString()} bytes (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`Parser: ${parser}`);
     console.log('='.repeat(80) + '\n');
     
     for (const algo of algorithms) {
         console.log(`Testing ${algo.toUpperCase()}...`);
         console.log('-'.repeat(80));
         
-        const hasher = new PDFHasher(dbConfig, false, algo);
+        const hasher = new PDFHasher(dbConfig, false, algo, parser);
         
         try {
             await hasher.connect();
@@ -452,80 +495,116 @@ async function main() {
     /**
      * Example usage of the PDFHasher class with algorithm comparison.
      */
-    // Load configuration from .env file
-    const dbConfig = {
-        host: process.env.DB_HOST,
-        port: parseInt(process.env.DB_PORT) || 5432,
-        username: process.env.DB_USERNAME,
-        password: process.env.DB_PASSWORD,
-        database: process.env.DB_DATABASE,
-        ssl: process.env.DB_SSL === 'true'
-    };
-    
-    // Validate configuration
-    if (!dbConfig.host || !dbConfig.username || !dbConfig.password || !dbConfig.database) {
-        console.log('\n' + '='.repeat(60));
-        console.log('⚠ Database configuration incomplete!');
-        console.log('='.repeat(60));
-        console.log('\nPlease set up your .env file with the following variables:');
-        console.log('  DB_HOST=your-neondb-host.neon.tech');
-        console.log('  DB_PORT=5432');
-        console.log('  DB_USERNAME=your_username');
-        console.log('  DB_PASSWORD=your_password');
-        console.log('  DB_DATABASE=neondb');
-        console.log('  DB_SSL=true');
-        console.log('\n' + '='.repeat(60) + '\n');
-        return;
-    }
-    
-    const PDF_FILE_PATH = '../taleoftwocities.pdf';  // Relative to node_implementation folder
-    // OR use absolute path: '/home/manu/Desktop/resumeHashingPOC/taleoftwocities.pdf'
-    
-    // Check if PDF file exists
-    try {
-        await fs.access(PDF_FILE_PATH);
-    } catch {
-        console.log(`\n⚠ Error: PDF file not found: ${PDF_FILE_PATH}`);
-        console.log('Please update PDF_FILE_PATH in the main() function\n');
-        return;
-    }
-    
-    // Run algorithm comparison
-    await compareAlgorithms(dbConfig, PDF_FILE_PATH);
-    
-    // Now process with recommended algorithm (BLAKE2b)
-    console.log('\n' + '='.repeat(80));
-    console.log('STORING HASH WITH RECOMMENDED ALGORITHM (BLAKE2B)');
-    console.log('='.repeat(80) + '\n');
-    
-    // Initialize hasher with content-only mode and BLAKE2b
-    const hasher = new PDFHasher(dbConfig, false, 'blake2b');
+    const rl = createReadlineInterface();
     
     try {
-        // Connect to database
-        await hasher.connect();
+        // Load configuration from .env file
+        const dbConfig = {
+            host: process.env.DB_HOST,
+            port: parseInt(process.env.DB_PORT) || 5432,
+            username: process.env.DB_USERNAME,
+            password: process.env.DB_PASSWORD,
+            database: process.env.DB_DATABASE,
+            ssl: process.env.DB_SSL === 'true'
+        };
         
-        // Create table if not exists
-        await hasher.createTable();
+        // Validate configuration
+        if (!dbConfig.host || !dbConfig.username || !dbConfig.password || !dbConfig.database) {
+            console.log('\n' + '='.repeat(60));
+            console.log('⚠ Database configuration incomplete!');
+            console.log('='.repeat(60));
+            console.log('\nPlease set up your .env file with the following variables:');
+            console.log('  DB_HOST=your-neondb-host.neon.tech');
+            console.log('  DB_PORT=5432');
+            console.log('  DB_USERNAME=your_username');
+            console.log('  DB_PASSWORD=your_password');
+            console.log('  DB_DATABASE=neondb');
+            console.log('  DB_SSL=true');
+            console.log('\n' + '='.repeat(60) + '\n');
+            return;
+        }
         
-        // Process PDF file
-        const result = await hasher.processPDF(PDF_FILE_PATH);
+        const PDF_FILE_PATH = '../taleoftwocities.pdf';  // Relative to node_implementation folder
+        // OR use absolute path: '/home/manu/Desktop/resumeHashingPOC/taleoftwocities.pdf'
         
-        // Print results
-        console.log('Results:');
-        console.log(`  File: ${result.fileName}`);
-        console.log(`  Hash: ${result.hash.substring(0, 64)}...`);
-        console.log(`  Algorithm: ${result.algorithm}`);
-        console.log(`  Content-only: ${result.contentOnly}`);
-        console.log(`  Size: ${result.fileSize} bytes`);
-        console.log(`  Time: ${(result.timeTaken * 1000).toFixed(2)}ms`);
-        console.log(`  Stored: ${result.stored ? 'Yes' : 'No (duplicate)'}`);
+        // Check if PDF file exists
+        try {
+            await fs.access(PDF_FILE_PATH);
+        } catch {
+            console.log(`\n⚠ Error: PDF file not found: ${PDF_FILE_PATH}`);
+            console.log('Please update PDF_FILE_PATH in the main() function\n');
+            return;
+        }
         
+        // Ask user which parser to use
+        console.log('\n' + '='.repeat(80));
+        console.log('PDF PARSER SELECTION');
+        console.log('='.repeat(80));
+        console.log('\nAvailable parsers:');
+        console.log('  1. pdf-parse   - Pure JavaScript, slower (~1700ms)');
+        console.log('  2. pdftotext   - Native C library, faster (~800ms, 2.1x speedup)');
+        console.log('\nNote: pdftotext requires poppler-utils to be installed');
+        console.log('      (sudo apt-get install poppler-utils)');
+        
+        let parser = 'pdf-parse';
+        const parserChoice = await askQuestion(rl, '\nWhich parser would you like to use? (1/2, default: 1): ');
+        
+        if (parserChoice === '2') {
+            // Check if pdftotext is available
+            try {
+                await execPromise('which pdftotext');
+                parser = 'pdftotext';
+                console.log('✓ Using pdftotext (poppler-utils detected)\n');
+            } catch {
+                console.log('\n⚠ Warning: pdftotext not found. Falling back to pdf-parse.');
+                console.log('  To install: sudo apt-get install poppler-utils\n');
+                parser = 'pdf-parse';
+            }
+        } else {
+            console.log('✓ Using pdf-parse\n');
+        }
+        
+        // Run algorithm comparison
+        await compareAlgorithms(dbConfig, PDF_FILE_PATH, parser);
+        
+        // Now process with recommended algorithm (BLAKE2b)
+        console.log('\n' + '='.repeat(80));
+        console.log('STORING HASH WITH RECOMMENDED ALGORITHM (BLAKE2B)');
+        console.log('='.repeat(80) + '\n');
+        
+        // Initialize hasher with content-only mode, BLAKE2b, and selected parser
+        const hasher = new PDFHasher(dbConfig, false, 'blake2b', parser);
+        
+        try {
+            // Connect to database
+            await hasher.connect();
+            
+            // Create table if not exists
+            await hasher.createTable();
+            
+            // Process PDF file
+            const result = await hasher.processPDF(PDF_FILE_PATH);
+            
+            // Print results
+            console.log('Results:');
+            console.log(`  File: ${result.fileName}`);
+            console.log(`  Hash: ${result.hash.substring(0, 64)}...`);
+            console.log(`  Algorithm: ${result.algorithm}`);
+            console.log(`  Content-only: ${result.contentOnly}`);
+            console.log(`  Size: ${result.fileSize} bytes`);
+            console.log(`  Time: ${(result.timeTaken * 1000).toFixed(2)}ms`);
+            console.log(`  Stored: ${result.stored ? 'Yes' : 'No (duplicate)'}`);
+            
+        } catch (error) {
+            console.error(`\n✗ Error: ${error.message}`);
+        } finally {
+            // Cleanup
+            await hasher.disconnect();
+        }
     } catch (error) {
-        console.error(`\n✗ Error: ${error.message}`);
+        console.error(`\n✗ Fatal Error: ${error.message}`);
     } finally {
-        // Cleanup
-        await hasher.disconnect();
+        rl.close();
     }
 }
 
