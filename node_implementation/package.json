@@ -1,0 +1,28 @@
+{
+  "name": "resume-hashing-poc",
+  "version": "1.0.0",
+  "description": "PDF content-based hashing with NeonDB - Node.js implementation",
+  "main": "pdf_hasher_node.js",
+  "type": "module",
+  "scripts": {
+    "start": "node pdf_hasher_node.js",
+    "compare": "node compare_algorithms_node.js",
+    "test": "node test_metadata_impact_node.js"
+  },
+  "keywords": [
+    "pdf",
+    "hash",
+    "deduplication",
+    "blake2b",
+    "neondb",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1",
+    "blake2": "^5.0.0"
+  }
+}
